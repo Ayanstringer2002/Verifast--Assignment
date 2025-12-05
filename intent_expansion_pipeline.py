@@ -1,192 +1,103 @@
-
-
 import os
 import json
 import argparse
-import numpy as np
-import pandas as pd
-from sklearn.cluster import KMeans
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sentence_transformers import SentenceTransformer
+import google.generativeai as genai
+from dotenv import load_dotenv
 
-# Gemini imports loader
-def _load_gemini_models():
-    from google.generativeai import GenerativeModel, TextEmbeddingModel
-    return GenerativeModel, TextEmbeddingModel
+# Load environment variables
+load_dotenv()
+genai_api_key = os.getenv("GEMINI_API_KEY")
 
-# Attempt optional imports
-try:
-    import umap
-    has_umap = True
-except ImportError:
-    has_umap = False
+if not genai_api_key:
+    raise ValueError("❌ GEMINI_API_KEY is missing in .env file.")
 
-try:
-    import hdbscan
-    has_hdbscan = True
-except ImportError:
-    has_hdbscan = False
+genai.configure(api_key=genai_api_key)
 
 
-# ----------------------------
-# Preprocessing
-# ----------------------------
-def basic_clean(text: str) -> str:
-    return " ".join(text.lower().strip().split())
+def load_json_file(input_json):
+    """Load JSON with UTF-8 encoding to avoid UnicodeDecodeError."""
+    try:
+        with open(input_json, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except UnicodeDecodeError:
+        raise ValueError(
+            f"❌ Failed to read {input_json}. Ensure it is saved using UTF-8 encoding."
+        )
 
 
-# ----------------------------
-# Embeddings (Gemini or fallback)
-# ----------------------------
-def embed_texts(texts, use_gemini=True, gemini_key=None):
-    if use_gemini and gemini_key:
-        try:
-            from google.generativeai import configure, TextEmbeddingModel
-            configure(api_key=gemini_key)
-
-            model = TextEmbeddingModel("models/embedding-001")
-            vectors = []
-
-            for t in texts:
-                resp = model.embed_content(t)
-                vectors.append(resp["embedding"])
-
-            return np.array(vectors)
-
-        except Exception as e:
-            print("Gemini embedding failed — falling back to sentence-transformers.")
-            print("ERROR:", e)
-
-    # Fallback to sentence-transformers (local)
-    model = SentenceTransformer("all-MiniLM-L6-v2")
-    return model.encode(texts, show_progress_bar=False)
+def call_gemini(prompt):
+    """Send prompt to Gemini API and return generated output."""
+    try:
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        print(f"❌ Gemini API Error: {e}")
+        return None
 
 
-# ----------------------------
-# Clustering
-# ----------------------------
-def cluster_embeddings(X, min_cluster_size=15, n_clusters=20):
-    if has_umap:
-        reducer = umap.UMAP(n_neighbors=15, min_dist=0.0, metric="cosine")
-        X_red = reducer.fit_transform(X)
-    else:
-        X_red = X
-
-    if has_hdbscan:
-        clusterer = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size, metric="euclidean")
-        labels = clusterer.fit_predict(X_red)
-    else:
-        km = KMeans(n_clusters=n_clusters, random_state=0)
-        labels = km.fit_predict(X_red)
-
-    return labels
-
-
-# ----------------------------
-# Cluster keyword extraction
-# ----------------------------
-def extract_keywords(texts, top_k=6):
-    vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2))
-    X = vectorizer.fit_transform(texts)
-
-    scores = np.asarray(X.mean(axis=0)).ravel()
-    idx = scores.argsort()[::-1][:top_k]
-    feats = vectorizer.get_feature_names_out()
-
-    return [feats[i] for i in idx]
-
-
-# ----------------------------
-# Gemini-based LLM proposal generator
-# ----------------------------
-def generate_proposal(cluster_summary, gemini_key):
-    from google.generativeai import configure
-    GenerativeModel, _ = _load_gemini_models()
-
-    configure(api_key=gemini_key)
-    model = GenerativeModel("gemini-pro")
-
+def expand_intent(text):
     prompt = f"""
-You are an expert in intent taxonomy design.
-Given this cluster summary:
-{cluster_summary}
+You are an AI that rewrites and expands user intents.
 
-Return:
-- Proposed primary intent (if new)
-- Proposed secondary intents
-- Rationale
-- Overlaps with existing mapped intents (if any)
+Original user text:
+{text}
+
+Generate:
+1. A cleaner, rewritten version.
+2. 5 variations.
+Return results in plain text.
 """
 
-    response = model.generate_text(prompt)
-    return response.text
+    return call_gemini(prompt)
 
 
-# ----------------------------
-# Main pipeline
-# ----------------------------
-def process(input_json, output_dir, gemini_key):
-    data = json.load(open(input_json))
-    df = pd.DataFrame(data)
-
-    df["clean"] = df["text"].apply(basic_clean)
-
-    print("Embedding…")
-    X = embed_texts(df["clean"].tolist(), use_gemini=True, gemini_key=gemini_key)
-
-    print("Clustering…")
-    labels = cluster_embeddings(X)
-    df["cluster"] = labels
-
-    clusters = {}
-
-    for c in sorted(df["cluster"].unique()):
-        sub = df[df["cluster"] == c]
-
-        clusters[c] = {
-            "count": len(sub),
-            "examples": sub["text"].head(10).tolist(),
-            "keywords": extract_keywords(sub["clean"].tolist()),
-        }
-
-    proposals = {}
-
-    print("Generating proposals with Gemini…")
-    for cid, obj in clusters.items():
-        summary = {
-            "cluster_id": cid,
-            "count": obj["count"],
-            "keywords": obj["keywords"],
-            "examples": obj["examples"][:5],
-        }
-
-        proposals[cid] = generate_proposal(summary, gemini_key)
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    json.dump(clusters, open(f"{output_dir}/cluster_examples.json", "w"), indent=2)
-    json.dump(proposals, open(f"{output_dir}/proposals.json", "w"), indent=2)
-
-    # Write Markdown Report
-    with open(f"{output_dir}/report.md", "w") as f:
-        for cid in clusters:
-            f.write(f"## Cluster {cid}\n")
-            f.write(f"Count: {clusters[cid]['count']}\n")
-            f.write(f"Keywords: {clusters[cid]['keywords']}\n")
-            f.write("### Proposal\n")
-            f.write(proposals[cid])
-            f.write("\n---\n")
+def ensure_output_dir(path):
+    if not os.path.exists(path):
+        os.makedirs(path)
+        print(f"📁 Created output directory: {path}")
 
 
-# ----------------------------
-# CLI
-# ----------------------------
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True)
-    parser.add_argument("--output_dir", default="out")
-    parser.add_argument("--gemini_key", required=True)
+def save_output(output_file, data):
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+    print(f"✅ Output saved to {output_file}")
+
+
+def process_pipeline(input_json, output_dir):
+    ensure_output_dir(output_dir)
+
+    print("📥 Loading JSON input...")
+    data = load_json_file(input_json)
+
+    results = []
+
+    print("⚙️ Processing intents using Gemini...")
+    for item in data:
+        text = item.get("text", "").strip()
+        if not text:
+            continue
+
+        expanded = expand_intent(text)
+        if expanded:
+            results.append({
+                "original": text,
+                "expanded": expanded
+            })
+
+    output_file = os.path.join(output_dir, "expanded_intents.json")
+    save_output(output_file, results)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Intent Expansion using Gemini API")
+    parser.add_argument("--input", type=str, required=True, help="Input JSON file")
+    parser.add_argument("--output_dir", type=str, default="output", help="Output folder")
 
     args = parser.parse_args()
 
-    process(args.input, args.output_dir, args.gemini_key)
+    process_pipeline(args.input, args.output_dir)
+
+
+if __name__ == "__main__":
+    main()
